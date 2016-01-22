@@ -1,0 +1,228 @@
+#-*- coding: utf-8 -*-
+from __future__ import division
+import os,sys
+import email
+import imaplib
+import smtplib
+import re
+import datetime
+import email
+import html2text
+import sqlite3
+import chardet
+from psutil._common import CONN_CLOSE
+import nltk
+from string import punctuation
+from collections import Counter
+from nltk.stem.wordnet import WordNetLemmatizer
+from nltk.corpus import stopwords
+#from blaze.expr.reductions import count
+#import enchant
+
+def insert_into_db(from_email_field,sent_field,to_field,subject_field,final_content_text, wordcount, sentencecount, verb_count,Modifier_Count,Average_Sentence_Length, Average_word_length, Pausality, Modal_Verb_Count, References_Count ,Emotiveness,Content_Diversity,Redundancy):
+    conW = sqlite3.connect(sqlite_file_W)
+    curW = conW.cursor()
+    curW.execute('INSERT INTO NLPEmailFile values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (from_email_field,sent_field,to_field,subject_field,final_content_text,wordcount,sentencecount, verb_count,Modifier_Count,Average_Sentence_Length, Average_word_length, Pausality, Modal_Verb_Count, References_Count ,Emotiveness,Content_Diversity,Redundancy))
+    conW.commit()
+    conW.close()
+
+
+
+#The Database to write to
+sqlite_file_W = 'D:\Database Files\NLPAllSpam2015.sqlite'
+
+conW = sqlite3.connect(sqlite_file_W)
+curW = conW.cursor()
+curW.execute('CREATE TABLE IF NOT EXISTS NLPEmailFile (FROM_FIELD TEXT,  SENT_FIELD NUMERIC, TO_FIELD TEXT, SUBJECT_FIELD TEXT, CONTENT_FIELD TEXT, WORD_COUNT NUMERIC, SENTENCE_COUNT NUMERIC, VERB_COUNT NUMERIC, MODIFIER_COUNT NUMERIC, AVG_SENTENCE_LEN NUMERIC, AVG_WORD_LEN NUMERIC, PAUSALITY NUMERIC, MODAL_VERB_COUNT NUMERIC, REFERENCES_COUNT NUMERIC, EMOTIVENESS NUMERIC, CONTENT_DIVERSITY NUMERIC, REDUNDANCY NUMERIC)')
+conW.commit()
+conW.close()
+
+
+# The Database to read from
+sqlite_file = 'D:\\......\\.sqlite'
+conR = sqlite3.connect(sqlite_file)
+curR = conR.cursor()
+
+'''
+sentence_file = open("sentences.txt", "w")
+word_file = open("words.txt", "w")
+
+'''
+# the result of a "cursor.execute" can be iterated over by row
+for row in curR.execute('SELECT * FROM EmailFile;'):
+    
+    from_email_field = row[0]
+    #print "from field: " + from_email_field
+    sent_field = row[1]
+    to_field= row[2]
+    subject_field= row[3]
+    content_text = row[4]
+    #raw_email_content = row[5]
+    #raw_email_text = row[6]
+    
+    #Removes http links
+    content_text = re.sub('''P\s\{(.*?)\}''','',content_text, flags = re.DOTALL)
+    content_text = re.sub('''To update this ticket, click 'Reply' to add details or a resolution to the.*''','',content_text,flags = re.DOTALL)
+    content_text = re.sub('\((.*?)\)','',content_text, flags = re.DOTALL)
+    content_text = re.sub(r"htt(p|ps)://.*\.[a-zA-Z]{1,5}(\/?\w+?)*", ' ',content_text)
+    content_text = re.sub('\w{1,3}\.\w+\.\w{1,5}','',content_text)
+    content_text = re.sub(r'cid:image.*',' ',content_text)
+    content_text= re.sub(r'^!.*',' ',content_text)
+    content_text = re.sub(r'\w?\s\{.*\}',' ',content_text,flags=re.MULTILINE|re.DOTALL)
+    
+    #content_text = re.sub(r"w{3}\.\w+\.\w{2,5}", ' ',content_text)
+    #print content_text 
+    
+    content_text= re.sub(r'/',' ',content_text)
+    content_text= re.sub(r'\]',' ',content_text)
+    content_text= re.sub(r'\[',' ',content_text)
+    content_text=re.sub(r'\(',' ',content_text)
+    content_text= re.sub(r':',' ',content_text)
+    content_text= re.sub(r';',' ',content_text)
+    content_text = re.sub(r'\n',' ',content_text)
+    content_text = re.sub('\s+', ' ', content_text)  # condense all whitespace
+    content_text = re.sub('[^A-Za-z ,!.]*', '', content_text)  # remove non-alpha chars except punctuations
+    final_content_text = content_text
+    pcounts = Counter(content_text)
+    punctuation_counts = {k:v for k, v in pcounts.iteritems() if k in punctuation}
+    pcounter=Counter(punctuation_counts)
+    punct_count = sum(pcounter.itervalues())
+    #print "Punctuation Count:" + str(punct_count)
+    
+    #print "content_text: " + final_content_text
+    #print "content_text size: " + str(len(content_text))
+    
+    
+    words = re.findall(r'\w+', content_text)    
+    '''
+    for w in words:
+        with open("201503_EmailID_words.txt", "a") as myfile1:
+            myfile1.write("%s \n" % w)
+            
+        #print "words: "+ str(w)
+    word_file.close()
+    '''
+    wordcount= len(re.findall(r'\w+',content_text)) # Counts number of words
+    
+    #print "wordcount:" + str(wordcount)  
+    
+    tokenized_sentence=nltk.sent_tokenize(content_text)
+    '''
+    for t in tokenized_sentence:
+        with open("201503_EmailID_sentences.txt", "a") as myfile2:
+            myfile2.write("%s \n" % t)
+            
+    sentence_file.close()
+    '''
+        
+    sentencecount=len(tokenized_sentence)
+    #print "sentencecount:  " + str(sentencecount)
+    if(sentencecount>0):
+        Average_Sentence_Length = wordcount/sentencecount;
+    else:
+        Average_Sentence_Length = 0 
+    chars_no_spaces = len([x for x in content_text if not x.isspace()]) # Prints number of Characters without counting spaces
+    #print "char_no_spaces:" + str(chars_no_spaces)    
+    if(wordcount>0): 
+        Average_word_length = chars_no_spaces/wordcount
+    else:
+        Average_word_length = 0
+    if(sentencecount>0):    
+        Pausality = punct_count/sentencecount
+    else:
+        Pausality=0
+            
+    content_textR = re.sub('[^A-Za-z ]+', '', content_text)  # remove any left over non-alpha chars
+    
+    words = content_textR.split()
+        
+    #print "words" + str(words)
+    #print "words length" + str(len(words))
+    
+    tokenized_w = nltk.word_tokenize(content_textR)
+    tokenized_word = [w.lower() for w in tokenized_w]
+    #print "tokenized_word: " + str(tokenized_word)
+    #print " tokenized word length:" + str(len(tokenized_word))
+    
+    lmtzr=WordNetLemmatizer()
+    lem = [lmtzr.lemmatize(l) for l in tokenized_word]
+    #print "lemmatized words: " + str(lem)
+        
+    tags=nltk.pos_tag(lem)
+    
+    #print "tags: " + str(tags)
+    #print " tags length:" + str(len(tags))
+    
+    unique_words=set(tags)
+    #print "unique words:" + str(unique_words)   
+    #print " unique words length:" + str(len(unique_words))
+    count_unique = Counter(tag for word,tag in unique_words)
+    unique_nouns= count_unique['NN']+count_unique['NNS']+count_unique['NNP']+ count_unique['NNPS']
+    unique_adjectives=count_unique['JJ']+count_unique['JJR']+count_unique['JJS']
+    unique_verbs=count_unique['VB']+ count_unique['VBD']+count_unique['VBG']+count_unique['VBN']+ count_unique['VBP']+count_unique['VBZ']
+    unique_adverbs=count_unique['RB']+count_unique['RBR']+count_unique['RBS']
+    diff_content_word_count = unique_nouns+unique_adjectives+unique_verbs+unique_adverbs
+    #print "Different content word count:" + str(diff_content_word_count )     
+               
+    counts = Counter(tag for word,tag in tags)
+    #print "Complete word counts:" + str(counts)
+    #Counting POS from tags
+    noun_count=counts['NN']+counts['NNS']+counts['NNP']+ counts['NNPS']
+    #print "noun_count:" + str(noun_count)
+    adjective_count=counts['JJ']+counts['JJR']+counts['JJS']
+    #print adjective_count
+    #print "adjective_count:" + str(adjective_count)
+    verb_count=counts['VB']+ counts['VBD']+counts['VBG']+counts['VBN']+ counts['VBP']+counts['VBZ']
+    #print "verb_count:" + str(verb_count)
+    #print "verb" + str(tags['VB'])
+    adverb_count=counts['RB']+counts['RBR']+counts['RBS']
+    #print "adverb_count:" + str(adverb_count)
+    #print "adverb" + str(tags['RB'])
+    Modifier_Count = adjective_count+adverb_count
+    
+    Modal_Verb_Count = counts['MD']
+    
+    
+    References_Count = counts['PRP']
+    
+    total_content_words = noun_count+adjective_count+verb_count+adverb_count
+    #print "Total Content Word Count:" + str(total_content_words)
+    
+    stop = stopwords.words('english')
+    function_words = Counter(i for i in lem if i in stop)
+    fcount=Counter(function_words)
+    Function_Word_Count = sum(fcount.itervalues())
+    
+    if(sentencecount>0):
+        Redundancy = Function_Word_Count/sentencecount
+    else:
+        Redundancy=0
+    #print "Function Word Count:" + str(Function_Word_Count)
+    #print "function words:" + str(function_words)
+    print "\n\n"
+    if((noun_count+verb_count)>0):
+        Emotiveness = (adjective_count+adverb_count)/(noun_count+verb_count)
+    else:
+        Emotiveness=0
+    
+    if(total_content_words>0):
+        Content_Diversity = diff_content_word_count/total_content_words
+    else:
+        Content_Diversity=0
+    '''
+    # create dictionary object
+    dictionary = enchant.Dict('en-US')
+    # count misspelled words
+    MisspelledCount = 0
+    for mw in lem:
+        MisspelledCount += sum([not dictionary.check(mw)])
+    
+    if(wordcount>0):
+        Typographical_error_ratio = MisspelledCount/wordcount
+        print "Typographical Error Ratio: ",Typographical_error_ratio
+    else:
+        Typographical_error_ratio=0
+    '''
+    insert_into_db(from_email_field,sent_field,to_field,subject_field,final_content_text, wordcount, sentencecount, verb_count,Modifier_Count,round(Average_Sentence_Length,4), round(Average_word_length,4), round(Pausality,4), Modal_Verb_Count, References_Count ,round(Emotiveness,4),round(Content_Diversity,4),round(Redundancy,4))
+    
+conR.close()
