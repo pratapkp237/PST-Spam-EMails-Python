@@ -1,0 +1,255 @@
+import os,sys
+import email
+import imaplib
+import smtplib
+import re
+import datetime
+import email
+import html2text
+import sqlite3
+import chardet
+from psutil._common import CONN_CLOSE
+
+def clean_content(content_text):
+    # Remove the links generated from html2text
+    content_text = re.sub(r"!?\[[\w\s\n]*\]\([\w\W\n]+?\)", r"", content_text)
+    # Remove the links with http://...
+    content_text = re.sub(r"https?://([^/]+/)+[\.-\?#\w]*", r"", content_text)
+    # Remove the links with ftp://...
+    content_text = re.sub(r"ftps?://([^/]+/)+[\.-\?#\w]*", r"", content_text)
+    # Remove the links with the pattern /...
+    # Remove the links with the pattern //...
+    content_text = re.sub(r"/?/([^/]+/)+[\.-\?#\w]*", r"", content_text)
+    # Remove the links ![]()
+    content_text = re.sub(r"!?\[\s*\]\(\s*\)", r"", content_text)
+    return content_text
+
+
+def text_to_date(datetext):
+    regex = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Ago|Sep|Oct|Nov|Dec)\w*\s+(\d+)\W+(\d*)(?:\s*(\d+):(\d+)\s*(\w*))?", datetext, flags=re.IGNORECASE) 
+    if regex is None:
+        return datetime.datetime.now()
+    month, day, year, hour, minutes, daypart = regex.groups()
+    year = int(year or 2015)
+    day = int(day)
+    daypart = (daypart or "am").lower()
+    hour = (int(hour or 0) + (12 if daypart == "pm" else 0))%24
+    minutes = int(minutes or 0) % 60
+    monthvalues={"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+    monthvalue = monthvalues[month.lower()]
+    if day > year: year, day = day, year
+    date = datetime.datetime(year, monthvalue, day, hour, minutes)
+    return date
+
+def imap_email_connect(server, username, password):
+    mail = imaplib.IMAP4_SSL(server)
+    mail.login(username, password)
+    return mail
+
+def insert_into_db(from_email, sent, to, subject, cleaned_content_text, raw_message, text_message):
+    conn = sqlite3.connect(sqlite_file)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO EmailFile values (?,?,?,?,?,?,?)', (from_email,text_to_date(sent),to,subject,cleaned_content_text,raw_message,text_message))
+    conn.commit()
+    conn.close()
+    
+def find_last_spam_emails(mail, folder_name, last_days):
+    print "FOLDER: ", folder_name
+    mail.select(folder_name) #Select all directories
+    #mail.select("April 2014") #Select all directories
+    date = (datetime.date.today() - datetime.timedelta(days=last_days, weeks=0, hours=0)).strftime("%d-%b-%Y") #Select email in the last days
+    result, fetch_data = mail.uid('search', None, '(SENTSINCE {date})'.format(date=date))
+
+    for message_uid in fetch_data[0].split()[::-1]: #Traverse in inverse order
+        result, email_data = mail.uid('fetch', message_uid, '(RFC822)')
+        email_message = email.message_from_string(email_data[0][1])
+        raw_email_message = email_message
+        raw_message = email_message.get_payload()       #To remove headers and other unnecessary parts of the message
+        while isinstance(raw_message, (list, tuple)): # Get only the message text, ignore attachments!
+            raw_email_message = raw_message[0]
+            raw_message = raw_message[0].get_payload()
+        charset = chardet.detect(str(raw_email_message))['encoding'] if raw_email_message.get_content_charset() is None else raw_email_message.get_content_charset()
+        raw_message = unicode(raw_email_message.get_payload(decode=True), str(charset)).encode('ascii', 'ignore')
+        analyze_email_text(raw_message, email_message)
+
+def html_email_content_to_text(html_content):
+    h = html2text.HTML2Text()
+    h.strong_mark = ""
+    h.ul_item_mark = ""
+    h.emphasis_mark = ""
+    raw_text = h.handle(html_content)
+    return re.sub(r"(?m)((?:From|Subject|Sent|To):[^\n]*)\n+(\W*[\w\.-?]+@.*?)", r"\1 \2", raw_text)
+
+def analyze_email_text(raw_email_content, email_message):
+    raw_email_text = html_email_content_to_text(raw_email_content.replace("\n", "<br>"))
+    sections = re.split("From:", raw_email_text, flags=re.MULTILINE|re.IGNORECASE)
+    if len(sections) == 1: #If this email has no information, return :D
+        return
+    for index, text in enumerate(sections[::-1]):
+        # Some messages apparently sent a fake sender inside their content
+        # which has the format "from:" but without a email address recorded in the imap server.
+        # So, we consider that text as a content and not as a header information...
+        #contains_a_real_sender = re.match(r".*?\s*\b([^\s]+@[\w\.-]+)\b.*", text, flags=re.IGNORECASE) is not None
+        contains_a_sent_date = re.search(r"(\bSent|\bDate):", text, flags=re.IGNORECASE) is not None
+        if "to:" in text.lower() and contains_a_sent_date:
+            # Tries to verify if there is some data in this level that can help us.
+            # If it is valid, so it inserts the info. in the DB and breaks the cycle.
+            if analyze_email_text_section(raw_email_content, email_message, raw_email_text, sections[len(sections) - 1 - index:]):
+                break
+
+def detect_recipients(last_text, email_message, from_field, from_email_field):
+    to_raw_field = ""
+    # Find the text where the "To:" field must be
+    regex_field = re.findall("(?:To|Reply-To|CC|CCO):(.*)", last_text, flags=re.IGNORECASE)
+    # If there is no data, it is supposed that the recipient is the global recipient
+    if len(regex_field) == 0:
+        regex_normal_email = re.findall(r"((?:\w|-|\.|=)+@(?:\w|-|\.|=)+)", str(email_message["to"]), flags=re.IGNORECASE)
+        if len(regex_normal_email) == 0:
+            return str(email_message["to"])
+        return regex_normal_email[-1]
+    #Now it will search the recipiento info. in each portion of text with "To:"
+    for to_raw_field in regex_field:
+        to_raw_field = to_raw_field.replace("   ", "")
+        to_field = None
+        #First, try to find complete email info.
+        regex_normal_email = re.findall(r"((?:\w|-|\.|=)+@(?:\w|-|\.|=)+)", to_raw_field, flags=re.IGNORECASE)
+        if regex_normal_email is not None:
+            # Due to probably, there are several recipients, it will try to catch all of them
+            to_field = " ".join(set(regex_normal_email)).lower()
+            if to_field.strip() == "":
+                to_field = "@mail.uc.edu ".join(set(re.findall(r"(\((?:\w|-|\.|=)+\))", to_raw_field, flags=re.IGNORECASE))).lower()
+                if to_field.strip() != "":
+                    to_field +=  "@mail.uc.edu"
+                    to_field = to_field.replace("(","").replace(")", "")
+                else:
+                    #But, it there is nothing, it will try with the next method...
+                    to_field = None
+        #In other case, it will try to search name-only emails
+        if to_field is None:
+            regex_simplified_email = re.search(r"(?:\(|\[)(.*?)(?:\)|\])", to_raw_field, flags=re.IGNORECASE)
+            if regex_simplified_email is None:
+                #In several cases, when the sender and recipient was the same in any part of the mail, only the first time
+                # the complete email is shown, the other times, only appears the name. So,
+                # to cover such cases, it compares the name in the field "To:" with the sender.
+                if re.sub(r"\W", "", to_raw_field) in re.sub(r"\W", "", from_field):
+                    return from_email_field
+                #But if it does not find anything, it will search the next time "To:" appears in the content...
+                continue
+            to_field = regex_simplified_email.groups(1)[0].strip()
+            to_field +=  "@mail.uc.edu"
+        return to_field
+    #Finally, of none method could be able to detect the recipient email, there is a little possibility, 
+    # that the complete data was lost. Thus, that situation is verified...
+    return (to_raw_field.replace(";","").strip() + "@<DOMAIN UNKNOWN>") if to_raw_field is not None and to_raw_field.strip() != "" else None
+            
+def delete_unseful_spaces(last_text):
+    last_text = re.sub(r">\s*\n+", r"\n", last_text, flags=re.MULTILINE) #Replace long newlines with > mark!
+    last_text = re.sub(r"\n+", r"\n", last_text, flags=re.MULTILINE) #Replace long newlines!
+    last_text = re.sub(r"=\s*\n*", r"", last_text, flags=re.MULTILINE) #Fix an error in the represenation return by outlook...
+    last_text = last_text.replace("\n", "    ").replace("\r", "    ")
+    return last_text
+
+def uniformize_symbols(last_text):
+    last_text = last_text.replace("<[", "[")
+    last_text = last_text.replace("<", "(")
+    last_text = last_text.replace("<(", "(")
+    last_text = last_text.replace("<]", "]")
+    last_text = last_text.replace(">", ")")
+    last_text = last_text.replace(")>", ")")
+    last_text = last_text.replace("mailto:", "")
+    return last_text
+
+def uniformize_field_apparitions(last_text):
+    last_text = re.sub(r"sent:", r"\nSent:", last_text, flags=re.IGNORECASE)
+    last_text = re.sub(r"\bdate:", r"\nSent:", last_text, flags=re.IGNORECASE)
+    last_text = re.sub(r"\bto:", r"\nTo:", last_text, flags=re.IGNORECASE)
+    last_text = re.sub(r"from:", r"\nFrom:", last_text, flags=re.IGNORECASE)
+    last_text = re.sub(r"subject:", r"\nSubject:", last_text, flags=re.IGNORECASE)
+    last_text = last_text.strip()
+    return last_text
+
+
+def analyze_email_text_section(raw_email_content, email_message, raw_email_text, section_text):
+    # Prepares the text:
+    last_text = "\nFrom:".join(section_text)
+    last_text = delete_unseful_spaces(last_text)
+    last_text = uniformize_symbols(last_text)
+    last_text = uniformize_field_apparitions(last_text)
+
+    # Recognizes the email elements:
+    from_field = re.search(r"^([\w\W]*?)(Reply-To|Sent|To|Date|Subject):", last_text, flags=re.MULTILINE).groups(1)[0].strip()
+    from_field = from_field.replace("   ", "")
+    try:
+        from_email_field = re.search(r"\b((?:\w|-|\.|=)+@(?:\w|-|\.|=)+)\b", from_field, flags=re.IGNORECASE).groups(1)[0].strip()
+    except Exception as e:
+        try:
+            from_email_field = re.search(r"(?:\(|\[)(.*?)(?:\)|\])", from_field, flags=re.IGNORECASE).groups(1)[0].strip()
+            from_email_field += "@mail.uc.edu"
+        except Exception as e:
+            # If there is not sender details, probably this email content is incomplete.
+            return False
+
+    try:
+        sent_field = re.search("Sent:(.*)", last_text, flags=re.IGNORECASE).groups(1)[0].strip()
+    except:
+        sent_field = "<NO SENT INFORMATION>"
+    
+    to_field = detect_recipients(last_text, email_message, from_field, from_email_field)
+    if to_field is None:
+        # If there is not recipients details, probably this email content is incomplete.
+        return False
+
+    last_text = last_text.replace("   ", "\n")
+    try:
+        subject_field = re.search("Subject:(.*)", last_text, flags=re.IGNORECASE).groups(1)[0].strip()
+    except:
+        subject_field = "<NO SUBJECT>"
+    content_text = "\n".join(re.split("subject:.*\n(.*)", last_text, flags=re.MULTILINE|re.IGNORECASE)[1:]).strip()
+    
+    # Show details:
+    """
+    print "EMAIL DETAILS!!"
+    print "ORIGINAL SENDER:", from_email_field
+    print "SENT:", sent_field
+    print "To:", to_field
+    print "SUBJECT:", subject_field
+    print "CONTENT:", content_text
+    print "=" * 80
+    """
+    content_text = re.sub(r'From:\s.*', '',content_text)
+    content_text = re.sub(r'Attachments:\s.*','',content_text)
+    content_text= re.sub(r'To:','',content_text)
+    content_text= re.sub(r'Sent:.*','',content_text)
+    content_text= re.sub(r'Reply-.*','',content_text)
+    content_text= re.sub(r'\s&lt.*','',content_text)
+    content_text= re.sub(r'\s\w+&.*\n\s\w*\)',' ',content_text,flags=re.MULTILINE)
+    content_text = re.sub(r'\w+?\.?\w+\@\w+\..*',' ',content_text)
+    content_text= re.sub(r'''[\(V]LSC\)53707338:1''',' ',content_text) 
+    
+    cleaned_content_text = clean_content(content_text)
+
+    insert_into_db(from_email_field,sent_field,to_field,subject_field, cleaned_content_text, raw_email_content.strip(), raw_email_text.strip())
+    return True
+
+
+
+mail=imap_email_connect(
+    server = "outlook.office365.com",
+    username = "Your Email Here", 
+    password = "Your Password Here"
+)
+
+sqlite_file = 'D:\...........'
+#table_name1 = 'EmailData'
+conn = sqlite3.connect(sqlite_file)
+c = conn.cursor()
+c.execute('CREATE TABLE IF NOT EXISTS EmailFile (FROM_FIELD TEXT,  SENT_FIELD NUMERIC, TO_FIELD TEXT, SUBJECT_FIELD TEXT, CONTENT_FIELD TEXT, HTML_MESSAGE TEXT, RAW_MESSAGE TEXT)')
+conn.commit()
+conn.close()
+# Find the information in the spam mails in the last two years
+find_last_spam_emails(mail, "Folder Name Here", last_days = 365*4)
+
+
+
+
+
